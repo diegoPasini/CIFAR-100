@@ -4,13 +4,17 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import random
+import os
 
 
-N = 20
-BATCH_SIZE = 16
+N = 120
+BATCH_SIZE = 128
+NUM_EPOCS = 100
 TRAINING_ITERATIONS = 100
 
-mps_device = torch.device("mps")
+cuda_device = torch.device("cuda")
+checkpoint_dir = '/root/CIFAR-100/checkpoints'
+os.makedirs(checkpoint_dir, exist_ok=True)
 
 def unpickle(file):
     import pickle
@@ -18,9 +22,20 @@ def unpickle(file):
         dict = pickle.load(fo, encoding='bytes')
     return dict
 
-meta_data = unpickle('/Users/diego/Scripts/CIFAR-100/cifar-100-python/meta')
-test_data = unpickle('/Users/diego/Scripts/CIFAR-100/cifar-100-python/test')
-train_data = unpickle('/Users/diego/Scripts/CIFAR-100/cifar-100-python/train')
+def save_checkpoint(model, optimizer, epoch, loss, accuracy, checkpoint_dir = checkpoint_dir):
+    checkpoint_path = os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss,
+        'accuracy': accuracy,
+    }, checkpoint_path)
+    print(f'Checkpoint saved at {checkpoint_path}')
+
+meta_data = unpickle('/root/CIFAR-100/cifar-100-python/meta')
+test_data = unpickle('/root/CIFAR-100/cifar-100-python/test')
+train_data = unpickle('/root/CIFAR-100/cifar-100-python/train')
 
 fine_label_names = meta_data[b'fine_label_names']
 print("Number of Labels: ", len(fine_label_names))
@@ -51,28 +66,48 @@ raw_test_data = torch.from_numpy(raw_test_data)
 raw_train_data = torch.from_numpy(raw_train_data)
 
 
-raw_test_data = raw_test_data.type(torch.FloatTensor).to(mps_device)
-raw_train_data = raw_train_data.type(torch.FloatTensor).to(mps_device)
+raw_test_data = raw_test_data.type(torch.FloatTensor).to(cuda_device)
+raw_train_data = raw_train_data.type(torch.FloatTensor).to(cuda_device)
 
 
 def get_batch(dataset_type = "train", batch_size = BATCH_SIZE):
     data = []
     labels = []
     if dataset_type == "train":
-        random_indices = [random.randint(0, raw_train_data.shape[0]) for i in range(batch_size)]
+        random_indices = [random.randint(0, raw_train_data.shape[0] - 1) for i in range(batch_size)]
         for i in random_indices:
             data.append(raw_train_data[i])
             labels.append(train_labels[i])
     elif dataset_type == "test":
-        random_indices = [random.randint(0, raw_test_data.shape[0]) for i in range(batch_size)]
+        random_indices = [random.randint(0, raw_test_data.shape[0] - 1) for i in range(batch_size)]
         for i in random_indices:
             data.append(raw_test_data[i])
             labels.append(test_labels[i])
     
     data = torch.stack(data) 
-    labels = torch.tensor(labels, device=mps_device)
+    labels = torch.tensor(labels, device=cuda_device)
     return data, labels  
 
+
+def evaluate(model, loss_func):
+    loss_avg = 0
+    correct_predictions = 0
+    total_samples = 0
+    model.eval()
+    with torch.no_grad():
+        num_batches = int(raw_test_data.shape[0] // BATCH_SIZE * 0.5)
+        print(num_batches)
+        for i in range(num_batches):
+            batch, labels = get_batch("test")
+            output = model(batch)
+            loss_avg += loss_func(output, labels).item()
+            _, predicted = torch.max(output, 1)
+            correct_predictions += (predicted == labels).sum().item()
+            total_samples += labels.size(0)
+    
+    loss_avg /= num_batches
+    accuracy_avg = (correct_predictions / total_samples) * 100
+    return loss_avg, accuracy_avg
 
 
 ## The Hyperparams, as given in https://arxiv.org/pdf/1512.03385 for CIFAR-10
@@ -81,6 +116,7 @@ class Residual_Block(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.dropout = nn.Dropout(p = 0.1)
 
         self.residual_core = nn.Sequential(
             # Dimensionality Reduction - Conv 1x1
@@ -117,7 +153,6 @@ class ResNet(nn.Module):
     def __init__(self, n):
         super().__init__()
 
-        # Implemented Incorrectly:
         self.conv_1 = Residual_Block(3, 16)
         self.list_1 = nn.ModuleList([Residual_Block(16, 16) for i in range(2 * n)])
         self.max_pool1 = nn.MaxPool2d(2, stride = 2)
@@ -129,7 +164,7 @@ class ResNet(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         # There are 200 labels in CIFAR-100
         self.finLinLay = nn.Linear(64, 200)
-        self.softmax = nn.Softmax(dim = -1)
+        #self.softmax = nn.Softmax(dim = -1)
     
     def forward(self, x):
         x = self.conv_1(x)
@@ -151,23 +186,39 @@ class ResNet(nn.Module):
         x = self.avg_pool(x)
         x = x.view(x.size(0), -1)
         x = self.finLinLay(x)
-        x = self.softmax(x)
+        #x = self.softmax(x)
         return x
 
-model = ResNet(N).to(mps_device)
+model = ResNet(N).to(cuda_device)
 
 total_params = sum(p.numel() for p in model.parameters())
 print("Total Model Parameters :", total_params)
 
-optimizer = torch.optim.Adam(model.parameters())
+optimizer = torch.optim.Adam(model.parameters(), lr = 0.001, weight_decay=1e-8)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
 cross_entropy = nn.CrossEntropyLoss()
 
-
-for i in tqdm(range(TRAINING_ITERATIONS)):
-    optimizer.zero_grad()
-    data, labels = get_batch("train")
-    output = model(data)
-    loss = cross_entropy(output, labels)
-    loss.backward()
-    print("Training Iteration: ", i, "Loss :", loss)
-    optimizer.step()
+for j in range(NUM_EPOCS):
+    print("Epoch: ", j)
+    train_acc = 0
+    model.train()
+    for i in tqdm(range(TRAINING_ITERATIONS)):
+        optimizer.zero_grad()
+        data, labels = get_batch("train")
+        output = model(data)
+        loss = cross_entropy(output, labels)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        scheduler.step(loss)
+        _, predicted = torch.max(output, 1)
+        train_acc += (predicted == labels).sum().item()
+        del data, labels, output
+        torch.cuda.empty_cache()
+    
+    final_train_acc = train_acc/(TRAINING_ITERATIONS * BATCH_SIZE) * 100
+    print("Training Loss: ", loss, "Training Accuracy: ", final_train_acc)
+    loss, accuracy = evaluate(model, cross_entropy)
+    print("Test Loss: ", loss, "Test Accuracy: ", accuracy)
+    save_checkpoint(model, optimizer, j, loss, accuracy)
+    torch.cuda.empty_cache()
