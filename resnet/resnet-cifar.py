@@ -7,8 +7,8 @@ import random
 import os
 
 
-N = 120
-BATCH_SIZE = 128
+N = 60
+BATCH_SIZE = 256
 NUM_EPOCS = 100
 TRAINING_ITERATIONS = 100
 
@@ -194,8 +194,8 @@ model = ResNet(N).to(cuda_device)
 total_params = sum(p.numel() for p in model.parameters())
 print("Total Model Parameters :", total_params)
 
-optimizer = torch.optim.Adam(model.parameters(), lr = 0.001, weight_decay=1e-8)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+optimizer = torch.optim.Adam(model.parameters(), lr = 0.001)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
 cross_entropy = nn.CrossEntropyLoss()
 
 for j in range(NUM_EPOCS):
