@@ -1,13 +1,16 @@
 import torch
 from torch import nn
-import tqdm
+from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import random
 
 
-N = 50
-BATCH_SIZE = 8
+N = 20
+BATCH_SIZE = 16
+TRAINING_ITERATIONS = 100
+
+mps_device = torch.device("mps")
 
 def unpickle(file):
     import pickle
@@ -15,9 +18,9 @@ def unpickle(file):
         dict = pickle.load(fo, encoding='bytes')
     return dict
 
-meta_data = unpickle('/Users/diego/Scripts/cifar-100-challenge/cifar-100-python/meta')
-test_data = unpickle('/Users/diego/Scripts/cifar-100-challenge/cifar-100-python/test')
-train_data = unpickle('/Users/diego/Scripts/cifar-100-challenge/cifar-100-python/train')
+meta_data = unpickle('/Users/diego/Scripts/CIFAR-100/cifar-100-python/meta')
+test_data = unpickle('/Users/diego/Scripts/CIFAR-100/cifar-100-python/test')
+train_data = unpickle('/Users/diego/Scripts/CIFAR-100/cifar-100-python/train')
 
 fine_label_names = meta_data[b'fine_label_names']
 print("Number of Labels: ", len(fine_label_names))
@@ -47,8 +50,9 @@ print("SHAPE : ", raw_test_data.shape)
 raw_test_data = torch.from_numpy(raw_test_data)
 raw_train_data = torch.from_numpy(raw_train_data)
 
-raw_test_data = raw_test_data.type(torch.FloatTensor)
-raw_train_data = raw_train_data.type(torch.FloatTensor)
+
+raw_test_data = raw_test_data.type(torch.FloatTensor).to(mps_device)
+raw_train_data = raw_train_data.type(torch.FloatTensor).to(mps_device)
 
 
 def get_batch(dataset_type = "train", batch_size = BATCH_SIZE):
@@ -66,9 +70,7 @@ def get_batch(dataset_type = "train", batch_size = BATCH_SIZE):
             labels.append(test_labels[i])
     
     data = torch.stack(data) 
-    print("Data :", data)
-    print("Data Shape: ", data.shape)
-    print("Labels :", labels)
+    labels = torch.tensor(labels, device=mps_device)
     return data, labels  
 
 
@@ -82,29 +84,33 @@ class Residual_Block(nn.Module):
 
         self.residual_core = nn.Sequential(
             # Dimensionality Reduction - Conv 1x1
-            nn.Conv2d(in_channels, out_channels // 2, 1),
+            nn.Conv2d(in_channels, out_channels // 2, 1, padding=0),
             nn.BatchNorm2d(out_channels // 2),
 
             nn.LeakyReLU(),
             
             # Feature Extraction
-            nn.Conv2d(out_channels // 2, out_channels // 2, 3),
+            nn.Conv2d(out_channels // 2, out_channels // 2, 3, padding=1),
             nn.BatchNorm2d(out_channels // 2),
             
             nn.LeakyReLU(),
             
             # Dimensionality Expansion
-            nn.Conv2d(out_channels // 2, out_channels, 1),
+            nn.Conv2d(out_channels // 2, out_channels, 1, padding=0),
             nn.BatchNorm2d(out_channels),
         )
+        
+        if in_channels != out_channels:
+                self.residual_conv = nn.Conv2d(in_channels, out_channels, 1)
+        else:
+            self.residual_conv = None
     
     def forward(self, x):
         residual = x
         x = self.residual_core(x)
-        if self.in_channels == self.out_channels:
-            x = nn.LeakyReLU()(x + residual)
-        else: 
-            x = nn.LeakyReLU()(x)
+        if self.residual_conv:
+            residual = self.residual_conv(residual)
+        x = nn.LeakyReLU()(x + residual)
         return x
 
 class ResNet(nn.Module):
@@ -120,7 +126,7 @@ class ResNet(nn.Module):
         self.max_pool2 = nn.MaxPool2d(2, stride = 2)
         self.conv_3 = Residual_Block(32, 64)
         self.list_3 = nn.ModuleList([Residual_Block(64, 64) for i in range(2 * n)])
-        self.avg_pool = nn.AvgPool2d(1)
+        self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         # There are 200 labels in CIFAR-100
         self.finLinLay = nn.Linear(64, 200)
         self.softmax = nn.Softmax(dim = -1)
@@ -143,17 +149,25 @@ class ResNet(nn.Module):
             x = block(x)
 
         x = self.avg_pool(x)
+        x = x.view(x.size(0), -1)
         x = self.finLinLay(x)
         x = self.softmax(x)
         return x
 
-model = ResNet(N)
+model = ResNet(N).to(mps_device)
 
 total_params = sum(p.numel() for p in model.parameters())
 print("Total Model Parameters :", total_params)
 
 optimizer = torch.optim.Adam(model.parameters())
-data, labels = get_batch("train")
-model(data)
+cross_entropy = nn.CrossEntropyLoss()
 
 
+for i in tqdm(range(TRAINING_ITERATIONS)):
+    optimizer.zero_grad()
+    data, labels = get_batch("train")
+    output = model(data)
+    loss = cross_entropy(output, labels)
+    loss.backward()
+    print("Training Iteration: ", i, "Loss :", loss)
+    optimizer.step()
