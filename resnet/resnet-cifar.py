@@ -5,15 +5,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 import random
 import os
+import wandb
 
 
 N = 60
 BATCH_SIZE = 256
 NUM_EPOCS = 100
-TRAINING_ITERATIONS = 100
+TRAINING_ITERATIONS = 50
+WANDB_PROJECT_NAME = "cifar-100"
 
 cuda_device = torch.device("cuda")
-checkpoint_dir = '/root/CIFAR-100/checkpoints'
+checkpoint_dir = './CIFAR-100/checkpoints'
 os.makedirs(checkpoint_dir, exist_ok=True)
 
 def unpickle(file):
@@ -33,9 +35,9 @@ def save_checkpoint(model, optimizer, epoch, loss, accuracy, checkpoint_dir = ch
     }, checkpoint_path)
     print(f'Checkpoint saved at {checkpoint_path}')
 
-meta_data = unpickle('/root/CIFAR-100/cifar-100-python/meta')
-test_data = unpickle('/root/CIFAR-100/cifar-100-python/test')
-train_data = unpickle('/root/CIFAR-100/cifar-100-python/train')
+meta_data = unpickle('./CIFAR-100/cifar-100-python/meta')
+test_data = unpickle('./CIFAR-100/cifar-100-python/test')
+train_data = unpickle('/CIFAR-100/cifar-100-python/train')
 
 fine_label_names = meta_data[b'fine_label_names']
 print("Number of Labels: ", len(fine_label_names))
@@ -194,6 +196,18 @@ model = ResNet(N).to(cuda_device)
 total_params = sum(p.numel() for p in model.parameters())
 print("Total Model Parameters :", total_params)
 
+wandb.init(project=WANDB_PROJECT_NAME)
+
+wandb.config.update({
+    "learning_rate": 0.001,
+    "batch_size": BATCH_SIZE,
+    "num_epochs": NUM_EPOCS,
+    "scheduler_patience": 10,
+    "scheduler_factor": 0.5,
+    "model_parameters": total_params
+})
+
+
 optimizer = torch.optim.Adam(model.parameters(), lr = 0.001)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
 cross_entropy = nn.CrossEntropyLoss()
@@ -220,5 +234,13 @@ for j in range(NUM_EPOCS):
     print("Training Loss: ", loss, "Training Accuracy: ", final_train_acc)
     loss, accuracy = evaluate(model, cross_entropy)
     print("Test Loss: ", loss, "Test Accuracy: ", accuracy)
+    wandb.log({
+        "epoch": j,
+        "training_loss": loss.item(),
+        "training_accuracy": final_train_acc,
+        "test_loss": loss,
+        "test_accuracy": accuracy
+    })
     save_checkpoint(model, optimizer, j, loss, accuracy)
     torch.cuda.empty_cache()
+    
