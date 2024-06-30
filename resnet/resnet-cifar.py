@@ -3,19 +3,25 @@ from torch import nn
 from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import v2
 import random
 import os
 import wandb
 
 
-N = 60
+# N = 60
 BATCH_SIZE = 256
-NUM_EPOCS = 100
+# NUM_EPOCS = 150
 TRAINING_ITERATIONS = 50
 WANDB_PROJECT_NAME = "cifar-100"
 
+resnet_sizes = [50]
+learning_rates = [0.1]
+num_epochs = [200]
+
 cuda_device = torch.device("cuda")
-checkpoint_dir = './CIFAR-100/checkpoints'
+checkpoint_dir = '/root/CIFAR-100/checkpoints'
 os.makedirs(checkpoint_dir, exist_ok=True)
 
 def unpickle(file):
@@ -35,9 +41,9 @@ def save_checkpoint(model, optimizer, epoch, loss, accuracy, checkpoint_dir = ch
     }, checkpoint_path)
     print(f'Checkpoint saved at {checkpoint_path}')
 
-meta_data = unpickle('./CIFAR-100/cifar-100-python/meta')
-test_data = unpickle('./CIFAR-100/cifar-100-python/test')
-train_data = unpickle('/CIFAR-100/cifar-100-python/train')
+meta_data = unpickle('/root/CIFAR-100/cifar-100-python/meta')
+test_data = unpickle('/root/CIFAR-100/cifar-100-python/test')
+train_data = unpickle('/root/CIFAR-100/cifar-100-python/train')
 
 fine_label_names = meta_data[b'fine_label_names']
 print("Number of Labels: ", len(fine_label_names))
@@ -59,36 +65,65 @@ index_from_label = lambda label : fine_label_names.index(label)
 
 raw_test_data = raw_test_data.reshape(raw_test_data.shape[0], 3, 32, 32)
 raw_test_data = raw_test_data.astype('uint8')
+
 raw_train_data = raw_train_data.reshape(raw_train_data.shape[0], 3, 32, 32)
 raw_train_data = raw_train_data.astype('uint8')
-
-print("SHAPE : ", raw_test_data.shape)
 
 raw_test_data = torch.from_numpy(raw_test_data)
 raw_train_data = torch.from_numpy(raw_train_data)
 
-
 raw_test_data = raw_test_data.type(torch.FloatTensor).to(cuda_device)
 raw_train_data = raw_train_data.type(torch.FloatTensor).to(cuda_device)
 
-
-def get_batch(dataset_type = "train", batch_size = BATCH_SIZE):
-    data = []
-    labels = []
-    if dataset_type == "train":
-        random_indices = [random.randint(0, raw_train_data.shape[0] - 1) for i in range(batch_size)]
-        for i in random_indices:
-            data.append(raw_train_data[i])
-            labels.append(train_labels[i])
-    elif dataset_type == "test":
-        random_indices = [random.randint(0, raw_test_data.shape[0] - 1) for i in range(batch_size)]
-        for i in random_indices:
-            data.append(raw_test_data[i])
-            labels.append(test_labels[i])
+class DatasetCIFAR100(Dataset):
+    def __init__(self, raw_data, labels):
+        self.raw_data = raw_data
+        self.labels = labels
+        self.mean = np.mean(raw_data)
+        self.std = np.std(raw_data)
     
-    data = torch.stack(data) 
-    labels = torch.tensor(labels, device=cuda_device)
-    return data, labels  
+    def __len__(self):
+        return len(train_labels)
+
+    def __getitem__(self, idx):
+        data = self.raw_data[idx]
+        transforms = v2.Compose([
+            v2.RandomResizedCrop(size=32, padding = 2),
+            v2.RandomHorizontalFlip(p = 0.5),
+            v2.RandomRotation(15),
+            v2.ToTensor(),
+            v2.Normalize(self.mean, self.std),
+        ])  
+
+        data = transforms(data)
+        return data
+    
+train_dataset = DatasetCIFAR100(raw_train_data, train_labels)
+test_dataset = DatasetCIFAR100(raw_test_data, test_labels)
+
+train_loader = DataLoader(train_dataset, batch_size = BATCH_SIZE, shuffle = True)
+test_loader = DataLoader(test_dataset, batch_size = BATCH_SIZE, shuffle = True)
+
+print("SHAPE : ", raw_test_data.shape)
+
+# def get_batch(dataset_type = "train", batch_size = BATCH_SIZE):
+#     data = []
+#     labels = []
+#     if dataset_type == "train":
+#         random_indices = [random.randint(0, raw_train_data.shape[0] - 1) for i in range(batch_size)]
+#         for i in random_indices:
+#             data.append(raw_train_data[i])
+#             labels.append(train_labels[i])
+#     elif dataset_type == "test":
+#         random_indices = [random.randint(0, raw_test_data.shape[0] - 1) for i in range(batch_size)]
+#         for i in random_indices:
+#             data.append(raw_test_data[i])
+#             labels.append(test_labels[i])
+    
+#     data = torch.stack(data) 
+#     labels = torch.tensor(labels, device=cuda_device)
+#     return data, labels  
+
 
 
 def evaluate(model, loss_func):
@@ -100,7 +135,7 @@ def evaluate(model, loss_func):
         num_batches = int(raw_test_data.shape[0] // BATCH_SIZE * 0.5)
         print(num_batches)
         for i in range(num_batches):
-            batch, labels = get_batch("test")
+            batch, labels = next(iter(test_loader))
             output = model(batch)
             loss_avg += loss_func(output, labels).item()
             _, predicted = torch.max(output, 1)
@@ -114,133 +149,119 @@ def evaluate(model, loss_func):
 
 ## The Hyperparams, as given in https://arxiv.org/pdf/1512.03385 for CIFAR-10
 class Residual_Block(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.dropout = nn.Dropout(p = 0.1)
+        self.stride = stride
 
         self.residual_core = nn.Sequential(
-            # Dimensionality Reduction - Conv 1x1
-            nn.Conv2d(in_channels, out_channels // 2, 1, padding=0),
-            nn.BatchNorm2d(out_channels // 2),
-
-            nn.LeakyReLU(),
-            
-            # Feature Extraction
-            nn.Conv2d(out_channels // 2, out_channels // 2, 3, padding=1),
-            nn.BatchNorm2d(out_channels // 2),
-            
-            nn.LeakyReLU(),
-            
-            # Dimensionality Expansion
-            nn.Conv2d(out_channels // 2, out_channels, 1, padding=0),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False),
             nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels)
         )
         
-        if in_channels != out_channels:
-                self.residual_conv = nn.Conv2d(in_channels, out_channels, 1)
-        else:
-            self.residual_conv = None
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
     
     def forward(self, x):
-        residual = x
-        x = self.residual_core(x)
-        if self.residual_conv:
-            residual = self.residual_conv(residual)
-        x = nn.LeakyReLU()(x + residual)
-        return x
+        out = self.residual_core(x)
+        out += self.shortcut(x)
+        return nn.ReLU(inplace=True)(out)
+
 
 class ResNet(nn.Module):
     def __init__(self, n):
         super().__init__()
 
-        self.conv_1 = Residual_Block(3, 16)
-        self.list_1 = nn.ModuleList([Residual_Block(16, 16) for i in range(2 * n)])
-        self.max_pool1 = nn.MaxPool2d(2, stride = 2)
-        self.conv_2 = Residual_Block(16, 32)
-        self.list_2 = nn.ModuleList([Residual_Block(32, 32) for i in range(2 * n - 1)])
-        self.max_pool2 = nn.MaxPool2d(2, stride = 2)
-        self.conv_3 = Residual_Block(32, 64)
-        self.list_3 = nn.ModuleList([Residual_Block(64, 64) for i in range(2 * n)])
+        self.conv_1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+
+        self.stage_1 = nn.ModuleList([Residual_Block(64, 64) for _ in range(2)])
+        self.stage_2 = nn.ModuleList([Residual_Block(64, 128, stride=2)] + [Residual_Block(128, 128) for _ in range(2)])
+        self.stage_3 = nn.ModuleList([Residual_Block(128, 256, stride=2)] + [Residual_Block(256, 256) for _ in range(2)])
+        self.stage_4 = nn.ModuleList([Residual_Block(256, 512, stride=2)] + [Residual_Block(512, 512) for _ in range(2)])
         self.avg_pool = nn.AdaptiveAvgPool2d((1, 1))
-        # There are 200 labels in CIFAR-100
-        self.finLinLay = nn.Linear(64, 200)
-        #self.softmax = nn.Softmax(dim = -1)
+        self.fc = nn.Linear(512, 100)
     
     def forward(self, x):
         x = self.conv_1(x)
-
-        for block in self.list_1:
+        for block in self.stage_1:
             x = block(x)
-        x = self.max_pool1(x)
-        x = self.conv_2(x)
-
-        for block in self.list_2:
+        for block in self.stage_2:
             x = block(x)
-
-        x = self.max_pool2(x)
-        x = self.conv_3(x)
-        
-        for block in self.list_3:
+        for block in self.stage_3:
             x = block(x)
-
+        for block in self.stage_4:
+            x = block(x)
         x = self.avg_pool(x)
         x = x.view(x.size(0), -1)
-        x = self.finLinLay(x)
-        #x = self.softmax(x)
+        x = self.fc(x)
         return x
 
-model = ResNet(N).to(cuda_device)
+for resnet_size in resnet_sizes:
+    for lr in learning_rates:
+        for epoch in num_epochs:
+            model = ResNet(resnet_size).to(cuda_device)
+            run_name = f"ResNet{resnet_size}_LR{lr}_BS{BATCH_SIZE}_EP{epoch}"
+            total_params = sum(p.numel() for p in model.parameters())
+            print(f"Total Model Parameters (ResNet-{resnet_size}): {total_params}")
 
-total_params = sum(p.numel() for p in model.parameters())
-print("Total Model Parameters :", total_params)
+            wandb.init(project=WANDB_PROJECT_NAME, name = run_name)
 
-wandb.init(project=WANDB_PROJECT_NAME)
+            wandb.config.update({
+                "resnet_size": resnet_size,
+                "learning_rate": lr,
+                "batch_size": BATCH_SIZE,
+                "num_epochs": epoch,
+                "scheduler_patience": 5,
+                "scheduler_factor": 0.5,
+                "model_parameters": total_params
+            })
 
-wandb.config.update({
-    "learning_rate": 0.001,
-    "batch_size": BATCH_SIZE,
-    "num_epochs": NUM_EPOCS,
-    "scheduler_patience": 10,
-    "scheduler_factor": 0.5,
-    "model_parameters": total_params
-})
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+            cross_entropy = nn.CrossEntropyLoss()
 
+            for j in range(epoch):
+                print("Epoch: ", j)
+                train_acc = 0
+                model.train()
+                for i in tqdm(range(TRAINING_ITERATIONS)):
+                    optimizer.zero_grad()
+                    data, labels = next(iter(train_loader))
+                    output = model(data)
+                    loss = cross_entropy(output, labels)
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+                    scheduler.step(loss)
+                    _, predicted = torch.max(output, 1)
+                    train_acc += (predicted == labels).sum().item()
+                    del data, labels, output
+                    torch.cuda.empty_cache()
 
-optimizer = torch.optim.Adam(model.parameters(), lr = 0.001)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
-cross_entropy = nn.CrossEntropyLoss()
+                final_train_acc = train_acc / (TRAINING_ITERATIONS * BATCH_SIZE) * 100
+                print("Training Loss: ", loss, "Training Accuracy: ", final_train_acc)
+                loss_test, accuracy = evaluate(model, cross_entropy)
+                print("Test Loss: ", loss_test, "Test Accuracy: ", accuracy)
+                wandb.log({
+                    "epoch": j,
+                    "training_loss": loss,
+                    "training_accuracy": final_train_acc,
+                    "test_loss": loss_test,
+                    "test_accuracy": accuracy
+                })
+                save_checkpoint(model, optimizer, j, loss, accuracy)
+                torch.cuda.empty_cache()
 
-for j in range(NUM_EPOCS):
-    print("Epoch: ", j)
-    train_acc = 0
-    model.train()
-    for i in tqdm(range(TRAINING_ITERATIONS)):
-        optimizer.zero_grad()
-        data, labels = get_batch("train")
-        output = model(data)
-        loss = cross_entropy(output, labels)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step(loss)
-        _, predicted = torch.max(output, 1)
-        train_acc += (predicted == labels).sum().item()
-        del data, labels, output
-        torch.cuda.empty_cache()
-    
-    final_train_acc = train_acc/(TRAINING_ITERATIONS * BATCH_SIZE) * 100
-    print("Training Loss: ", loss, "Training Accuracy: ", final_train_acc)
-    loss, accuracy = evaluate(model, cross_entropy)
-    print("Test Loss: ", loss, "Test Accuracy: ", accuracy)
-    wandb.log({
-        "epoch": j,
-        "training_loss": loss.item(),
-        "training_accuracy": final_train_acc,
-        "test_loss": loss,
-        "test_accuracy": accuracy
-    })
-    save_checkpoint(model, optimizer, j, loss, accuracy)
-    torch.cuda.empty_cache()
-    
+            wandb.finish()
